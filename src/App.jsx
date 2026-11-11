@@ -4,7 +4,19 @@ import {
   signOut,
   onAuthStateChanged,
 } from 'firebase/auth'
-import { auth, googleProvider, isFirebaseConfigured } from './firebase'
+import {
+  doc,
+  getDoc,
+  setDoc,
+  collection,
+  addDoc,
+  query,
+  orderBy,
+  limit,
+  getDocs,
+  serverTimestamp,
+} from 'firebase/firestore'
+import { auth, db, googleProvider, isFirebaseConfigured } from './firebase'
 import './App.css'
 
 const BOARD_WIDTH = 10
@@ -191,11 +203,140 @@ export default function App() {
   const [isSigningIn, setIsSigningIn] = useState(false)
   const [authMessage, setAuthMessage] = useState(null)
 
+  // Firestore 개인 최고 점수 및 최근 기록 상태
+  const [bestScore, setBestScore] = useState(null)
+  const [recentRecords, setRecentRecords] = useState([])
+  const [loadingRecords, setLoadingRecords] = useState(false)
+  const [saveStatusText, setSaveStatusText] = useState('')
+
   const gameRef = useRef(game)
   gameRef.current = game
 
   const userRef = useRef(user)
   userRef.current = user
+
+  const savedGameOverRef = useRef(false)
+
+  // Firestore에서 사용자의 최고 점수와 최근 기록 불러오기
+  const fetchUserRecords = useCallback(async (currentUser) => {
+    if (!db || !currentUser) return
+    setLoadingRecords(true)
+    try {
+      const userDocRef = doc(db, 'users', currentUser.uid)
+      const userSnap = await getDoc(userDocRef)
+      if (userSnap.exists()) {
+        const data = userSnap.data()
+        setBestScore(typeof data.bestScore === 'number' ? data.bestScore : 0)
+      } else {
+        setBestScore(0)
+      }
+
+      const recordsRef = collection(db, 'users', currentUser.uid, 'records')
+      const q = query(recordsRef, orderBy('createdAt', 'desc'), limit(5))
+      const querySnap = await getDocs(q)
+      const list = []
+      querySnap.forEach((docSnap) => {
+        list.push({ id: docSnap.id, ...docSnap.data() })
+      })
+      setRecentRecords(list)
+    } catch (error) {
+      console.error('Firestore 기록 조회 오류:', error)
+    } finally {
+      setLoadingRecords(false)
+    }
+  }, [])
+
+  // 게임 오버 시 Firestore에 게임 기록 추가 및 개인 최고 점수 갱신
+  const saveGameResultToFirestore = useCallback(
+    async (finalScore, finalLines, finalLevel) => {
+      const currentUser = userRef.current
+      if (!db || !currentUser) return
+
+      setSaveStatusText('Firebase에 기록 저장 중...')
+      try {
+        const safeScore = Math.max(0, Math.floor(finalScore))
+        const safeLines = Math.max(0, Math.floor(finalLines))
+        const safeLevel = Math.max(1, Math.floor(finalLevel))
+        const safeName = (
+          currentUser.displayName ||
+          currentUser.email ||
+          '플레이어'
+        ).slice(0, 100)
+
+        // 1. 개별 게임 기록 추가 (users/{uid}/records)
+        const recordsRef = collection(db, 'users', currentUser.uid, 'records')
+        await addDoc(recordsRef, {
+          uid: currentUser.uid,
+          displayName: safeName,
+          score: safeScore,
+          lines: safeLines,
+          level: safeLevel,
+          createdAt: serverTimestamp(),
+          playedAt: serverTimestamp(),
+        })
+
+        // 2. 개인 최고 점수 문서 생성 또는 업데이트 (users/{uid})
+        const userDocRef = doc(db, 'users', currentUser.uid)
+        const userSnap = await getDoc(userDocRef)
+
+        let updatedBestScore = safeScore
+        let isNewRecord = true
+
+        if (userSnap.exists()) {
+          const prev = userSnap.data()
+          const prevBest = typeof prev.bestScore === 'number' ? prev.bestScore : 0
+          updatedBestScore = Math.max(prevBest, safeScore)
+          isNewRecord = safeScore > prevBest
+
+          await setDoc(
+            userDocRef,
+            {
+              uid: currentUser.uid,
+              displayName: safeName,
+              email: currentUser.email ? currentUser.email.slice(0, 254) : null,
+              photoURL: currentUser.photoURL
+                ? currentUser.photoURL.slice(0, 2048)
+                : null,
+              bestScore: updatedBestScore,
+              bestLines: Math.max(prev.bestLines || 0, safeLines),
+              bestLevel: Math.max(prev.bestLevel || 1, safeLevel),
+              totalGames: (prev.totalGames || 0) + 1,
+              updatedAt: serverTimestamp(),
+            },
+            { merge: true }
+          )
+        } else {
+          await setDoc(userDocRef, {
+            uid: currentUser.uid,
+            displayName: safeName,
+            email: currentUser.email ? currentUser.email.slice(0, 254) : null,
+            photoURL: currentUser.photoURL
+              ? currentUser.photoURL.slice(0, 2048)
+              : null,
+            bestScore: safeScore,
+            bestLines: safeLines,
+            bestLevel: safeLevel,
+            totalGames: 1,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          })
+        }
+
+        setBestScore(updatedBestScore)
+        setSaveStatusText(
+          isNewRecord
+            ? '🎉 개인 최고 점수 경신! Firebase에 기록이 저장되었습니다.'
+            : 'Firebase에 게임 기록이 저장되었습니다.'
+        )
+
+        await fetchUserRecords(currentUser)
+      } catch (error) {
+        console.error('Firestore 점수 저장 실패:', error)
+        setSaveStatusText('기록 저장에 실패했습니다. 네트워크 및 보안 규칙을 확인해 주세요.')
+      }
+    },
+    [fetchUserRecords]
+  )
 
   // onAuthStateChanged로 로그인 상태 감지 및 새로고침 시 로그인 유지
   useEffect(() => {
@@ -209,8 +350,11 @@ export default function App() {
       (currentUser) => {
         setUser(currentUser)
         setAuthLoading(false)
-        if (!currentUser) {
-          // 로그아웃 시 진행 중이던 게임을 대기 상태로 초기화
+        if (currentUser) {
+          fetchUserRecords(currentUser)
+        } else {
+          setBestScore(null)
+          setRecentRecords([])
           setGame((prev) =>
             prev.status === 'idle' ? prev : createInitialGameState('idle')
           )
@@ -227,7 +371,17 @@ export default function App() {
     )
 
     return () => unsubscribe()
-  }, [])
+  }, [fetchUserRecords])
+
+  // 게임 오버 상태 전환 감지 시 1회만 Firestore 저장 실행
+  useEffect(() => {
+    if (game.status === 'gameover' && user && !savedGameOverRef.current) {
+      savedGameOverRef.current = true
+      saveGameResultToFirestore(game.score, game.lines, game.level)
+    } else if (game.status !== 'gameover') {
+      savedGameOverRef.current = false
+    }
+  }, [game.status, game.score, game.lines, game.level, user, saveGameResultToFirestore])
 
   // Google로 로그인 (GoogleAuthProvider + signInWithPopup)
   const handleGoogleLogin = useCallback(async () => {
@@ -442,6 +596,7 @@ export default function App() {
       return
     }
 
+    setSaveStatusText('')
     setGame((prev) => {
       if (prev.status === 'idle' || prev.status === 'gameover') {
         return createInitialGameState('playing')
@@ -476,6 +631,7 @@ export default function App() {
       })
       return
     }
+    setSaveStatusText('')
     setGame(createInitialGameState('playing'))
   }, [])
 
@@ -612,6 +768,12 @@ export default function App() {
   const isPlaying = game.status === 'playing' && Boolean(user)
   const userDisplayName = user?.displayName || user?.email || '플레이어'
 
+  const bestScoreText = !user
+    ? '-'
+    : bestScore === null
+      ? '불러오는 중...'
+      : `${bestScore.toLocaleString('ko-KR')}점`
+
   return (
     <div className="tetris-wrapper">
       <header className="tetris-header">
@@ -646,9 +808,9 @@ export default function App() {
                 </div>
               </div>
 
-              <div className="best-score-slot" aria-label="개인 최고 점수 표시 자리">
+              <div className="best-score-slot" aria-label="개인 최고 점수">
                 <span className="best-score-label">개인 최고 점수</span>
-                <span className="best-score-placeholder">저장 연동 예정</span>
+                <span className="best-score-value">{bestScoreText}</span>
               </div>
             </div>
 
@@ -726,7 +888,7 @@ export default function App() {
                   <>
                     <div className="overlay-title">테트리스 시작하기</div>
                     <p className="overlay-desc">
-                      {userDisplayName}님, 클리어 목표 없이 최고 점수에 도전하세요!
+                      {userDisplayName}님, 최고 점수({bestScoreText}) 경신에 도전하세요!
                     </p>
                     <button
                       type="button"
@@ -774,6 +936,9 @@ export default function App() {
                 <p className="overlay-desc">
                   도달 레벨 Lv.{game.level} · 지운 줄 수 {game.lines}줄
                 </p>
+                {saveStatusText && (
+                  <div className="overlay-save-status">{saveStatusText}</div>
+                )}
                 <button
                   type="button"
                   className="btn btn-primary"
@@ -897,7 +1062,7 @@ export default function App() {
             </div>
           </div>
 
-          {/* 점수 · 레벨 · 지운 줄 수 · 개인 최고 점수 자리 */}
+          {/* 점수 · 레벨 · 지운 줄 수 · 개인 최고 점수 */}
           <div className="panel-card">
             <div className="card-title">게임 기록 현황</div>
             <div className="stats-grid">
@@ -908,8 +1073,8 @@ export default function App() {
               </div>
               <div className="stat-box">
                 <span className="stat-label">개인 최고 점수</span>
-                <span className="stat-value-placeholder">저장 연동 예정</span>
-                <span className="stat-sub">다음 단계에서 Firestore 연동</span>
+                <span className="stat-value stat-value-highlight">{bestScoreText}</span>
+                <span className="stat-sub">Firebase 자동 저장</span>
               </div>
               <div className="stat-box">
                 <span className="stat-label">레벨</span>
@@ -923,6 +1088,33 @@ export default function App() {
               </div>
             </div>
           </div>
+
+          {/* 내 최근 게임 기록 (Firestore) */}
+          {user && (
+            <div className="panel-card">
+              <div className="card-title">내 최근 게임 기록 (최근 5판)</div>
+              {loadingRecords ? (
+                <div className="records-empty">기록을 불러오는 중...</div>
+              ) : recentRecords.length === 0 ? (
+                <div className="records-empty">
+                  아직 저장된 게임 기록이 없습니다. 게임을 플레이해 보세요!
+                </div>
+              ) : (
+                <ul className="records-list">
+                  {recentRecords.map((rec) => (
+                    <li key={rec.id} className="record-item">
+                      <span className="record-score">
+                        {(rec.score ?? 0).toLocaleString('ko-KR')}점
+                      </span>
+                      <span className="record-meta">
+                        Lv.{rec.level ?? 1} · {rec.lines ?? 0}줄
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
 
           {/* 키보드 조작법 & 점수표 */}
           <div className="panel-card">

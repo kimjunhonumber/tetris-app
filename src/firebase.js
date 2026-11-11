@@ -1,5 +1,6 @@
 import { initializeApp } from 'firebase/app'
 import { getAuth, GoogleAuthProvider } from 'firebase/auth'
+import { getFirestore } from 'firebase/firestore'
 
 const firebaseConfig = {
   apiKey: import.meta.env.VITE_FIREBASE_API_KEY?.trim() || '',
@@ -27,16 +28,18 @@ export const isFirebaseConfigured = Boolean(
 
 let app = null
 let auth = null
+let db = null
 let googleProvider = null
 
 if (isFirebaseConfigured) {
   try {
     app = initializeApp(firebaseConfig)
     auth = getAuth(app)
+    db = getFirestore(app)
     googleProvider = new GoogleAuthProvider()
   } catch (error) {
     console.error('Firebase 초기화 오류:', error)
   }
 }
 
-export { app, auth, googleProvider, firebaseConfig }
+export { app, auth, db, googleProvider, firebaseConfig }

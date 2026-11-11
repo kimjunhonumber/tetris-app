@@ -1,0 +1,218 @@
+rules_version = '2';
+
+// ===============================================================
+// Assumed Data Model
+// ===============================================================
+//
+// 1. Collection: users/{userId}
+//    Document ID: Firebase Auth UID (userId)
+//    Fields:
+//      - uid: string (optional, immutable, must match userId) - User UID
+//      - displayName: string | null (optional, <= 100 chars) - User display name
+//      - email: string | null (optional, <= 254 chars) - User email (PII - owner read only)
+//      - photoURL: string | null (optional, <= 2048 chars) - Profile image URL
+//      - bestScore: int (optional, >= 0, non-decreasing on update) - Personal high score
+//      - bestLines: int (optional, >= 0) - Most lines cleared
+//      - bestLevel: int (optional, >= 1) - Highest level reached
+//      - totalGames: int (optional, >= 0) - Total games played
+//      - createdAt: timestamp (optional, immutable once set) - Account creation timestamp
+//      - updatedAt: timestamp (optional) - Last update timestamp
+//
+// 2. Subcollections: users/{userId}/games/{gameId} & users/{userId}/records/{recordId}
+//    Document ID: Auto-generated game record ID
+//    Fields:
+//      - score: int (required, >= 0) - Final score of the game
+//      - lines: int (required, >= 0) - Lines cleared in the game
+//      - level: int (required, >= 1) - Level reached in the game
+//      - uid: string (optional, must match userId) - Owner UID
+//      - displayName: string | null (optional, <= 100 chars) - Player display name
+//      - createdAt: timestamp (optional) - Record creation timestamp
+//      - playedAt: timestamp (optional) - Game completion timestamp
+//
+// 3. Top-level Collections: scores/{scoreId} & gameRecords/{recordId}
+//    Document ID: Auto-generated score/record ID
+//    Fields:
+//      - uid: string (required, must match request.auth.uid) - Owner UID
+//      - score: int (required, >= 0) - Final score of the game
+//      - lines: int (required, >= 0) - Lines cleared in the game
+//      - level: int (required, >= 1) - Level reached in the game
+//      - displayName: string | null (optional, <= 100 chars) - Player display name
+//      - createdAt: timestamp (optional) - Record creation timestamp
+//      - playedAt: timestamp (optional) - Game completion timestamp
+//
+// ===============================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+
+    // 로그인 여부 확인
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // 경로의 userId와 로그인한 사용자의 UID 일치 여부 확인
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // 기존 문서의 uid 필드와 로그인한 사용자의 UID 일치 여부 확인
+    function isDocOwner() {
+      return isAuthenticated() && resource.data.uid == request.auth.uid;
+    }
+
+    // 허용된 필드만 포함되어 있는지 확인 (스키마 오염 방지)
+    function hasOnlyAllowedFields(allowedFields) {
+      return request.resource.data.keys().hasOnly(allowedFields);
+    }
+
+    // 필수 필드가 모두 포함되어 있는지 확인
+    function hasRequiredFields(requiredFields) {
+      return request.resource.data.keys().hasAll(requiredFields);
+    }
+
+    // 선택적 문자열(또는 null) 필드 길이 검증 (DoS/대용량 페이로드 방지)
+    function isValidOptionalNullableString(data, field, maxLen) {
+      return !(field in data) ||
+        data[field] == null ||
+        (data[field] is string && data[field].size() <= maxLen);
+    }
+
+    // 선택적 타임스탬프 필드 검증
+    function isValidOptionalTimestamp(data, field) {
+      return !(field in data) || data[field] is timestamp;
+    }
+
+    // 선택적 정수 범위 검증
+    function isValidOptionalIntRange(data, field, minVal, maxVal) {
+      return !(field in data) ||
+        (data[field] is int && data[field] >= minVal && data[field] <= maxVal);
+    }
+
+    // ===============================================================
+    // Domain Validators
+    // ===============================================================
+
+    // users/{userId} 문서 생성/수정 데이터 검증
+    function isValidUserDoc(data, userId) {
+      let allowedFields = [
+        'uid',
+        'displayName',
+        'email',
+        'photoURL',
+        'bestScore',
+        'bestLines',
+        'bestLevel',
+        'totalGames',
+        'createdAt',
+        'updatedAt'
+      ];
+      return data.keys().size() >= 1 &&
+        hasOnlyAllowedFields(allowedFields) &&
+        (!( 'uid' in data ) || (data.uid is string && data.uid == userId)) &&
+        isValidOptionalNullableString(data, 'displayName', 100) &&
+        isValidOptionalNullableString(data, 'email', 254) &&
+        isValidOptionalNullableString(data, 'photoURL', 2048) &&
+        isValidOptionalIntRange(data, 'bestScore', 0, 1000000000) &&
+        isValidOptionalIntRange(data, 'bestLines', 0, 1000000) &&
+        isValidOptionalIntRange(data, 'bestLevel', 1, 10000) &&
+        isValidOptionalIntRange(data, 'totalGames', 0, 10000000) &&
+        isValidOptionalTimestamp(data, 'createdAt') &&
+        isValidOptionalTimestamp(data, 'updatedAt');
+    }
+
+    // users/{userId} 업데이트 시 불변 필드 및 최고 점수 역전 방지 검증
+    function isValidUserUpdate(userId) {
+      let data = request.resource.data;
+      let prev = resource.data;
+      let uidUnchanged = !('uid' in prev) || data.get('uid', prev.uid) == prev.uid;
+      let createdAtUnchanged = !('createdAt' in prev) || data.get('createdAt', prev.createdAt) == prev.createdAt;
+      let bestScoreNonDecreasing = !('bestScore' in data) ||
+        !('bestScore' in prev) ||
+        data.bestScore >= prev.bestScore;
+
+      return isValidUserDoc(data, userId) &&
+        uidUnchanged &&
+        createdAtUnchanged &&
+        bestScoreNonDecreasing;
+    }
+
+    // 게임 기록 데이터 검증 (서브컬렉션용)
+    function isValidUserGameRecord(data, userId) {
+      let allowedFields = [
+        'uid',
+        'displayName',
+        'score',
+        'lines',
+        'level',
+        'createdAt',
+        'playedAt'
+      ];
+      return hasRequiredFields(['score', 'lines', 'level']) &&
+        hasOnlyAllowedFields(allowedFields) &&
+        data.score is int && data.score >= 0 && data.score <= 1000000000 &&
+        data.lines is int && data.lines >= 0 && data.lines <= 1000000 &&
+        data.level is int && data.level >= 1 && data.level <= 10000 &&
+        (!('uid' in data) || (data.uid is string && data.uid == userId)) &&
+        isValidOptionalNullableString(data, 'displayName', 100) &&
+        isValidOptionalTimestamp(data, 'createdAt') &&
+        isValidOptionalTimestamp(data, 'playedAt');
+    }
+
+    // 게임 기록 데이터 검증 (최상위 컬렉션용: uid 필수)
+    function isValidTopLevelGameRecord(data) {
+      return ('uid' in data) &&
+        data.uid is string &&
+        data.uid == request.auth.uid &&
+        isValidUserGameRecord(data, request.auth.uid);
+    }
+
+    // ===============================================================
+    // Collection Rules
+    // ===============================================================
+
+    // 1. 사용자 프로필 및 개인 최고 점수 문서
+    match /users/{userId} {
+      allow read: if isOwner(userId);
+      allow create: if isOwner(userId) && isValidUserDoc(request.resource.data, userId);
+      allow update: if isOwner(userId) && isValidUserUpdate(userId);
+      allow delete: if false;
+
+      // 2-A. 사용자별 게임 기록 서브컬렉션 (games)
+      match /games/{gameId} {
+        allow read: if isOwner(userId);
+        allow create: if isOwner(userId) && isValidUserGameRecord(request.resource.data, userId);
+        allow update, delete: if false;
+      }
+
+      // 2-B. 사용자별 게임 기록 서브컬렉션 (records)
+      match /records/{recordId} {
+        allow read: if isOwner(userId);
+        allow create: if isOwner(userId) && isValidUserGameRecord(request.resource.data, userId);
+        allow update, delete: if false;
+      }
+    }
+
+    // 3-A. 최상위 점수 기록 컬렉션 (scores)
+    match /scores/{scoreId} {
+      allow read: if isDocOwner();
+      allow create: if isAuthenticated() && isValidTopLevelGameRecord(request.resource.data);
+      allow update, delete: if false;
+    }
+
+    // 3-B. 최상위 게임 기록 컬렉션 (gameRecords)
+    match /gameRecords/{recordId} {
+      allow read: if isDocOwner();
+      allow create: if isAuthenticated() && isValidTopLevelGameRecord(request.resource.data);
+      allow update, delete: if false;
+    }
+
+    // 4. 그 외 모든 경로 기본 차단 (Default Deny)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
